@@ -1,5 +1,4 @@
 // SKTorrent Stremio addon s TMDB (CZ/SK názvy) a pokročilým fallbackom
-require("dotenv").config();
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const { decode } = require("entities");
 const axios = require("axios");
@@ -417,3 +416,4 @@ builder.defineCatalogHandler(() => ({ metas: [] }));
 
 serveHTTP(builder.getInterface(), { port: 7000 });
 console.log("🚀 SKTorrent addon beží na http://localhost:7000/manifest.json");
+
