@@ -204,7 +204,11 @@ async function hladatTorrenty(dotaz) {
             const velkostMatch = text.match(/Velkost\s([^|]+)/i);
             const seedMatch = text.match(/Odosielaju\s*:\s*(\d+)/i);
 
-            if (!kategoria.toLowerCase().includes("film") && !kategoria.toLowerCase().includes("seri")) return;
+            if (!kategoria.toLowerCase().includes("film") && 
+    !kategoria.toLowerCase().includes("seri") &&
+    !kategoria.toLowerCase().includes("dokum") &&
+    !kategoria.toLowerCase().includes("tv")) return;
+
 
             vysledky.push({
                 name: nazov,
@@ -426,4 +430,5 @@ builder.defineCatalogHandler(() => ({ metas: [] }));
 
 serveHTTP(builder.getInterface(), { port: 7000 });
 console.log("🚀 SKTorrent addon beží na http://localhost:7000/manifest.json");
+
 
