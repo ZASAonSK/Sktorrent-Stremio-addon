@@ -1,6 +1,5 @@
 // SKTorrent Stremio addon v1.2.0 - IGNORUJE NUVIO TYPE BUG
 // Automaticky deteguje Movie/Series podľa formátu IMDb ID
-require("dotenv").config();
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const { decode } = require("entities");
 const axios = require("axios");
@@ -427,3 +426,4 @@ builder.defineCatalogHandler(() => ({ metas: [] }));
 
 serveHTTP(builder.getInterface(), { port: 7000 });
 console.log("🚀 SKTorrent addon beží na http://localhost:7000/manifest.json");
+
