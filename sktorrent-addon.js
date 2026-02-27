@@ -11,9 +11,11 @@ const https = require("https");
 const SKT_UID = process.env.SKT_UID || "";
 const SKT_PASS = process.env.SKT_PASS || "";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
-
-// Získanie TorBox API kľúča (Musíš ho pridať do svojho .env súboru!)
 const TORBOX_API_KEY = process.env.TORBOX_API_KEY || ""; 
+
+// NOVÉ VECI PRE RENDER:
+const PORT = process.env.PORT || 7000; // Render si nastaví vlastný port
+const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`; // Pre cloud nastavíme v Renderi, inak použije lokál
 
 const BASE_URL = "https://sktorrent.eu"; // Pre lokálny HTTP prepíš na "http://..."
 const SEARCH_URL = `${BASE_URL}/torrent/torrents_v2.php`;
@@ -562,23 +564,21 @@ builder.defineStreamHandler(async ({ type: aplikaciaTyp, id }) => {
             const staraKategoria = stream.name.split("\n")[1] || "";
 
             if (jeCached) {
-                // Cached (⚡) - TOTO PREHRÁVA PRIAMO Z TORBOXU CEZ HTTP
                 stream.name = `[TB ⚡] SKT\n${staraKategoria}`;
-                // Zmeníme objekt: odstránime infoHash a dáme mu HTTP URL na náš proxy
-                // Namiesto indexu pošleme do proxy Séria/Epizóda
                 const proxySeria = seria || "1";
                 const proxyEpizoda = epizoda || "1";
-                stream.url = `http://localhost:7000/play/${hash}/${proxySeria}/${proxyEpizoda}`;
+                // ZMENA LOKALHOSTU NA PREMENNÚ
+                stream.url = `${PUBLIC_URL}/play/${hash}/${proxySeria}/${proxyEpizoda}`;
                 delete stream.infoHash;
                 delete stream.fileIdx;
             } else {
-                // Uncached (⏳) - TOTO SPUSTÍ SŤAHOVANIE NA TORBOXE
                 stream.name = `[TB ⏳] SKT\n${staraKategoria}`;
-                // Nasmerujeme na "Download" endpoint
-                stream.url = `http://localhost:7000/download/${hash}`;
+                // ZMENA LOKALHOSTU NA PREMENNÚ
+                stream.url = `${PUBLIC_URL}/download/${hash}`;
                 delete stream.infoHash;
                 delete stream.fileIdx;
             }
+
             return stream;
         });
 
@@ -742,8 +742,8 @@ app.get("/download/:hash", async (req, res) => {
             }
         }
 
-        // Presmerujeme Stremio na náš vlastný lokálny súbor s videom
-        res.redirect(302, "http://localhost:7000/info-video");
+        // Presmerujeme Stremio na server
+        res.redirect(302, `${PUBLIC_URL}/info-video`);
         
     } catch (err) {
         console.error("[ERROR] Zlyhalo stahovanie do TorBoxu:", err.response?.data || err.message);
@@ -766,6 +766,7 @@ app.use("/", getRouter(builder.getInterface()));
 
 const PORT = 7000;
 app.listen(PORT, () => {
-    console.log(`🚀 SKTorrent Local + TorBox PROXY beží na http://localhost:${PORT}/manifest.json`);
+    console.log(`🚀 SKTorrent Local + TorBox PROXY beží na ${PUBLIC_URL}/manifest.json`);
 });
+
 
