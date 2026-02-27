@@ -764,9 +764,9 @@ app.get("/info-video", (req, res) => {
 const { getRouter } = require("stremio-addon-sdk");
 app.use("/", getRouter(builder.getInterface()));
 
-const PORT = 7000;
 app.listen(PORT, () => {
     console.log(`🚀 SKTorrent Local + TorBox PROXY beží na ${PUBLIC_URL}/manifest.json`);
 });
+
 
 
