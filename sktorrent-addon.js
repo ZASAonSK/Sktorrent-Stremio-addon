@@ -1,29 +1,77 @@
-// SKTorrent Stremio addon v1.2.0 - IGNORUJE NUVIO TYPE BUG
-// Automaticky deteguje Movie/Series podľa formátu IMDb ID
+// SKTorrent Local Addon v1.3.0 - OPTIMALIZOVANÝ + TORBOX
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const { decode } = require("entities");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const bencode = require("bncode");
 const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
 
 const SKT_UID = process.env.SKT_UID || "";
 const SKT_PASS = process.env.SKT_PASS || "";
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 
-const BASE_URL = "https://sktorrent.eu";
+// Získanie TorBox API kľúča (Musíš ho pridať do svojho .env súboru!)
+const TORBOX_API_KEY = process.env.TORBOX_API_KEY || ""; 
+
+const BASE_URL = "https://sktorrent.eu"; // Pre lokálny HTTP prepíš na "http://..."
 const SEARCH_URL = `${BASE_URL}/torrent/torrents_v2.php`;
 
-// V definícii addon-u stále nechávame typy, aby ho Stremio rozpoznalo pre oba
+// ===================================================================
+// OPTIMALIZÁCIA: Rýchly sieťový klient (Keep-Alive) pre lokál
+// ===================================================================
+const agentOptions = { keepAlive: true, maxSockets: 50 };
+const fastAxios = axios.create({
+    timeout: 5000, 
+    httpAgent: new http.Agent(agentOptions),
+    httpsAgent: new https.Agent(agentOptions),
+    headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Cookie": `uid=${SKT_UID}; pass=${SKT_PASS}`,
+        "Referer": BASE_URL,
+        "Connection": "keep-alive"
+    }
+});
+
+// ===================================================================
+// CACHE a CONCURRENCY SYSTÉM
+// ===================================================================
+const cache = new Map();
+async function withCache(key, ttlMs, fetcher) {
+    const cached = cache.get(key);
+    if (cached && Date.now() < cached.expires) return cached.data;
+    
+    const data = await fetcher();
+    if (data && (!Array.isArray(data) || data.length > 0) && Object.keys(data).length !== 0) {
+        cache.set(key, { data, expires: Date.now() + ttlMs });
+    }
+    return data;
+}
+
+function pLimit(limit) {
+    let active = 0; const q = [];
+    const next = () => {
+        if (active >= limit || q.length === 0) return;
+        active++;
+        const { fn, resolve, reject } = q.shift();
+        fn().then(resolve, reject).finally(() => { active--; next(); });
+    };
+    return (fn) => new Promise((resolve, reject) => { q.push({ fn, resolve, reject }); next(); });
+}
+
+// ===================================================================
+// STREMIO ADDON DEFINÍCIA
+// ===================================================================
 const builder = addonBuilder({
-    id: "org.stremio.sktorrent",
-    version: "1.2.0",
-    name: "SKTorrent",
-    description: "Streamuj torrenty z SKTorrent.eu (CZ/SK názvy)",
+    id: "org.stremio.sktorrent.local.torbox",
+    version: "1.3.0",
+    name: "SKT Local + TorBox",
+    description: "Rýchly lokálny SKTorrent s detekciou TorBox Cache",
     types: ["movie", "series"],
     catalogs: [
-        { type: "movie", id: "sktorrent-movie", name: "SKTorrent Filmy" },
-        { type: "series", id: "sktorrent-series", name: "SKTorrent Seriály" }
+        { type: "movie", id: "skt-movie", name: "SKT Filmy" },
+        { type: "series", id: "skt-series", name: "SKT Seriály" }
     ],
     resources: ["stream"],
     idPrefixes: ["tt"]
@@ -32,242 +80,286 @@ const builder = addonBuilder({
 const langToFlag = {
     CZ: "🇨🇿", SK: "🇸🇰", EN: "🇬🇧", US: "🇺🇸",
     DE: "🇩🇪", FR: "🇫🇷", IT: "🇮🇹", ES: "🇪🇸",
-    RU: "🇷🇺", PL: "🇵🇱", HU: "🇭🇺", JP: "🇯🇵",
-    KR: "🇰🇷", CN: "🇨🇳"
+    RU: "🇷🇺", PL: "🇵🇱", HU: "🇭🇺", JP: "🇯🇵"
 };
 
-const delay = ms => new Promise(res => setTimeout(res, ms));
+function odstranDiakritiku(str) { return str.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+function skratNazov(title, pocetSlov = 3) { return title.split(/\s+/).slice(0, pocetSlov).join(" "); }
 
-function odstranDiakritiku(str) {
-    return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-}
-
-function skratNazov(title, pocetSlov = 3) {
-    return title.split(/\s+/).slice(0, pocetSlov).join(" ");
+// ===================================================================
+// TORBOX: OVERENIE CACHE (Hromadne)
+// ===================================================================
+async function overitTorboxCache(infoHashes) {
+    if (!TORBOX_API_KEY || infoHashes.length === 0) return {};
+    
+    const unikatneHashe = [...new Set(infoHashes)].map(h => h.toLowerCase());
+    const hashString = unikatneHashe.sort().join(",");
+    
+    return withCache(`torbox:${hashString}`, 600000, async () => { // Cache na 10 min
+        console.log(`[INFO] ⚡ Overujem cache na TorBoxe pre ${unikatneHashe.length} hashov...`);
+        try {
+            const res = await axios.get(`https://api.torbox.app/v1/api/torrents/checkcached`, {
+                params: {
+                    hash: unikatneHashe.join(","),
+                    format: "list"
+                },
+                headers: {
+                    "Authorization": `Bearer ${TORBOX_API_KEY}`
+                },
+                timeout: 5000
+            });
+            
+            const cacheMap = {};
+            // TorBox vráti dáta v res.data.data
+            if (res.data && res.data.success && res.data.data) {
+                const poleDat = Array.isArray(res.data.data) ? res.data.data : [res.data.data];
+                poleDat.forEach(item => {
+                    if (item.hash) {
+                        cacheMap[item.hash.toLowerCase()] = true; 
+                    }
+                });
+            }
+            return cacheMap;
+        } catch (error) {
+            console.error("[ERROR] TorBox API zlyhalo:", error.message);
+            return {};
+        }
+    });
 }
 
 // ===================================================================
-// FILTER 1: Kontrola Série (Rýchly filter názvu)
+// FILTRE PRE SERIÁLY (Opravené na Balíky/Packy)
 // ===================================================================
 function torrentSedisSeriou(nazovTorrentu, seria) {
-    if (/S\d{1,2}\s*[-–]\s*S?\d{1,2}/i.test(nazovTorrentu) || /Seasons?\s*\d{1,2}\s*[-–]\s*\d{1,2}/i.test(nazovTorrentu)) {
-        return true; 
-    }
+    if (/S\d{1,2}\s*[-–]\s*S?\d{1,2}/i.test(nazovTorrentu) || /Seasons?\s*\d{1,2}\s*[-–]\s*\d{1,2}/i.test(nazovTorrentu)) return true; 
     const serieMatch = nazovTorrentu.match(/\b(\d+)\.Serie\b/i);
     if (serieMatch && parseInt(serieMatch[1]) !== seria) return false;
-    
     const seasonMatch = nazovTorrentu.match(/\bSeason\s+(\d+)\b/i);
     if (seasonMatch && parseInt(seasonMatch[1]) !== seria) return false;
-    
     const sMatch = nazovTorrentu.match(/\bS(\d{2})(?!E)/i);
     if (sMatch && parseInt(sMatch[1]) !== seria) return false;
-    
     return true;
 }
 
-// ===================================================================
-// FILTER 2: Kontrola Epizódy a Rozsahov (Detailný filter)
-// ===================================================================
 function torrentSediSEpizodou(nazov, seria, epizoda) {
     const seriaStr = String(seria).padStart(2, "0");
     const epStr = String(epizoda).padStart(2, "0");
 
-    const rozsahSerii = nazov.match(/S(\d{1,2})[-–]S?(\d{1,2})/i) || 
-                        nazov.match(/Seasons?\s*(\d{1,2})[-–](\d{1,2})/i);
-    if (rozsahSerii) {
-        const startSeria = parseInt(rozsahSerii[1]);
-        const endSeria = parseInt(rozsahSerii[2]);
-        if (seria >= startSeria && seria <= endSeria) return true; 
+    // =========================================================
+    // 1. ZABIJAK NESPRÁVNYCH EPIZÓD (Najdôležitejší krok)
+    // =========================================================
+    // Ak je v názve explicitne iná epizóda, okamžite to zahodíme, aj keby to bol balík.
+    
+    // Extrahujeme všetky "E" čísla pre danú sériu (napr. z "S01E05" vyberie "05")
+    const najdeneE = nazov.match(new RegExp(`S${seriaStr}[._-]?E(\\d{1,3})`, "i"));
+    const najdeneX = nazov.match(new RegExp(`${seria}x(\\d{1,3})`, "i"));
+    
+    let toMaZluEpizodu = false;
+    
+    if (najdeneE && parseInt(najdeneE[1]) !== parseInt(epizoda)) {
+        toMaZluEpizodu = true; // Zistil, že tam je napr. E05, a my hľadáme E02
+    }
+    if (najdeneX && parseInt(najdeneX[1]) !== parseInt(epizoda)) {
+        toMaZluEpizodu = true; // Zistil, že tam je napr. 1x05, a my hľadáme 1x02
     }
 
-    const maEpizoduTag = new RegExp(`S${seriaStr}E\\d+`, "i").test(nazov);
-    if (!maEpizoduTag) return true;
+    // Ochrana pred tým, ak by náhodou niekto zapísal rozsah ako "S01E01-E05" alebo "S01E01-05"
+    // Nesmieme to zabiť, ak sa naša epizóda nachádza vnútri tohto rozsahu.
+    const jeToRozsahE = nazov.match(/E(\d{1,3})[._-]?E?(\d{1,3})/i);
+    if (jeToRozsahE) {
+        const zaciatokE = parseInt(jeToRozsahE[1]);
+        const koniecE = parseInt(jeToRozsahE[2]);
+        if (epizoda >= zaciatokE && epizoda <= koniecE) {
+            toMaZluEpizodu = false; // Je to rozsah a sme v ňom, ZACHRÁNIME TO!
+        }
+    }
 
-    const priamaZhoda = new RegExp(`S${seriaStr}[._-]?E${epStr}\\b`, "i");
-    if (priamaZhoda.test(nazov)) return true;
+    // Ak to má fakt len jednu ZLÚ epizódu (napr. S01E05), odstrelíme to okamžite tu.
+    if (toMaZluEpizodu) {
+        return false; 
+    }
 
-    const rozsahEpizod = nazov.match(new RegExp(`S${seriaStr}E(\\d+)[._-]E?(\\d+)`, "i"));
+
+
+    // =========================================================
+    // 2. KONTROLY, KTORÉ TO MÔŽU PUSTIŤ
+    // =========================================================
+
+    // A) Priama zhoda: Presne tá epizóda, ktorú hľadáme (S01E02)
+    if (new RegExp(`S${seriaStr}[._-]?E${epStr}\\b`, "i").test(nazov)) return true;
+    if (new RegExp(`\\b${seria}x${epStr}\\b`, "i").test(nazov)) return true;
+
+    // B) Rozsah epizód: Sme vnútri rozsahu? (napr. hľadáme E02 v balíku E01-E05)
+    const rozsahEpizod = nazov.match(/E(\d{1,3})[._-]?E?(\d{1,3})/i) || nazov.match(/(?:Dily?|Parts?|Epizody?|Eps?|Ep)?[._\s]*(\d{1,3})\s*[-–]\s*(\d{1,3})/i);
     if (rozsahEpizod) {
-        const startEp = parseInt(rozsahEpizod[1]);
-        const endEp = parseInt(rozsahEpizod[2]);
-        return epizoda >= startEp && epizoda <= endEp;
+        const zaciatok = parseInt(rozsahEpizod[1] || rozsahEpizod[2]);
+        const koniec = parseInt(rozsahEpizod[2] || rozsahEpizod[3]);
+        if (epizoda >= zaciatok && epizoda <= koniec) return true;
     }
 
+    // C) Obrovské balíky viacerých sérií (Napr. "S01-S08" alebo "1.-8. série")
+    const rozsahSerii = nazov.match(/S(\d{1,2})\s*[-–]\s*S?(\d{1,2})/i) || 
+                        nazov.match(/(?:Season|S[eé]rie)\s*(\d{1,2})\s*[-–]\s*(\d{1,2})/i) ||
+                        nazov.match(/(\d{1,2})\.\s*[-–]\s*(\d{1,2})\.\s*s[eé]rie/i);
+    if (rozsahSerii) {
+        const zaciatokSer = parseInt(rozsahSerii[1]);
+        const koniecSer = parseInt(rozsahSerii[2]);
+        if (seria >= zaciatokSer && seria <= koniecSer) return true;
+    }
+
+    // D) Obyčajný balík pre jednu sériu (Nemá žiadne čísla epizód, len S01 alebo "1. série")
+    const jeToCelaSeria = new RegExp(`\\b${seria}\\.\\s*s[eé]rie\\b`, "i").test(nazov) || 
+                          new RegExp(`\\bSeason\\s*${seria}\\b`, "i").test(nazov) || 
+                          new RegExp(`\\bS${seriaStr}\\b`, "i").test(nazov) ||
+                          /\b(Pack|Komplet|Complete|Vol|Volume)\b/i.test(nazov);
+                          
+    if (jeToCelaSeria) {
+        return true; 
+    }
+
+    // Ak nič z toho neplatí, letí to do koša
     return false;
 }
 
+
+
 // ===================================================================
-// Získanie názvov (TMDB + Cinemeta)
+// Získanie názvov (Súbežne TMDB + Cinemeta)
 // ===================================================================
-// POZOR: Prijíma už "vlastnyTyp", ktorý si určíme sami z ID
-async function ziskatNazvyZTMDB(imdbId, vlastnyTyp) {
-    if (!TMDB_API_KEY) return [];
-    try {
-        const tmdbTyp = vlastnyTyp === "series" ? "tv" : "movie";
-        const hladanie = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
-            params: { api_key: TMDB_API_KEY, external_source: "imdb_id" }, timeout: 7000
-        });
-
-        let tmdbId = null, baseTitle = null, originalTitle = null;
-
-        if (vlastnyTyp === "series" && hladanie.data.tv_results?.length > 0) {
-            const r = hladanie.data.tv_results[0];
-            tmdbId = r.id; baseTitle = r.name; originalTitle = r.original_name;
-        } else if (vlastnyTyp === "movie" && hladanie.data.movie_results?.length > 0) {
-            const r = hladanie.data.movie_results[0];
-            tmdbId = r.id; baseTitle = r.title; originalTitle = r.original_title;
-        }
-
-        const nazvy = new Set();
-        if (baseTitle) nazvy.add(baseTitle);
-        if (originalTitle) nazvy.add(originalTitle);
-        if (!tmdbId) return [...nazvy];
-
-        const preklady = await axios.get(`https://api.themoviedb.org/3/${tmdbTyp}/${tmdbId}/translations`, {
-            params: { api_key: TMDB_API_KEY }, timeout: 7000
-        });
-
-        if (preklady.data?.translations) {
-            preklady.data.translations.forEach(tr => {
-                const meno = (tr.data || {}).title || (tr.data || {}).name;
-                if (meno && ["cs", "sk", "en"].includes(tr.iso_639_1)) nazvy.add(meno);
-            });
-        }
-        const vysledok = [...nazvy].filter(Boolean);
-        console.log(`[DEBUG] 🌝 Názvy z TMDB: ${vysledok.join(" | ")}`);
-        return vysledok;
-    } catch (chyba) {
-        console.error("[ERROR] TMDB chyba:", chyba.message);
-        return [];
-    }
-}
-
-async function ziskatNazvyZCinemeta(imdbId, vlastnyTyp) {
-    try {
-        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${vlastnyTyp}/${imdbId}.json`, { timeout: 5000 });
-        if (!res.data?.meta) return [];
-        const meta = res.data.meta;
-        const nazvy = new Set();
-        if (meta.name) nazvy.add(decode(meta.name).trim());
-        if (meta.original_name) nazvy.add(decode(meta.original_name).trim());
-        if (meta.aliases) meta.aliases.forEach(a => nazvy.add(decode(a).trim()));
-        const vysledok = [...nazvy].filter(Boolean);
-        console.log(`[DEBUG] 🌍 Názvy z Cinemeta: ${vysledok.join(" | ")}`);
-        return vysledok;
-    } catch { return []; }
-}
-
 async function ziskatVsetkyNazvy(imdbId, vlastnyTyp) {
-    const tmdbNazvy = await ziskatNazvyZTMDB(imdbId, vlastnyTyp);
-    const cineNazvy = await ziskatNazvyZCinemeta(imdbId, vlastnyTyp);
-    const nazvy = new Set([...tmdbNazvy, ...cineNazvy]);
+    return withCache(`names:${imdbId}`, 21600000, async () => { 
+        const nazvy = new Set();
+        const tmdbTyp = vlastnyTyp === "series" ? "tv" : "movie";
+        
+        const promises = [
+            axios.get(`https://v3-cinemeta.strem.io/meta/${vlastnyTyp}/${imdbId}.json`, { timeout: 4000 }).catch(() => null)
+        ];
 
-    if (imdbId === "tt27543632") { nazvy.add("Pomocnice"); nazvy.add("Pomocníčka"); }
-    if (imdbId === "tt0903747")  { nazvy.add("Perníkový táta"); nazvy.add("Pernikovy tata"); }
-    if (imdbId === "tt27497448") { nazvy.add("Rytíř sedmi království"); nazvy.add("Rytier siedmich kráľovstiev"); }
+        if (TMDB_API_KEY) {
+            promises.push(
+                axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, { params: { api_key: TMDB_API_KEY, external_source: "imdb_id" }, timeout: 4000 }).catch(() => null)
+            );
+        }
 
-    const finalne = [...nazvy].filter(Boolean).filter(t => !t.toLowerCase().startsWith("výsledky"));
-    console.log(`[DEBUG] ✅ Finálne názvy na vyhľadávanie: ${finalne.join(" | ")}`);
-    return finalne;
+        const [cineRes, tmdbRes] = await Promise.all(promises);
+
+        if (cineRes && cineRes.data?.meta) {
+            const m = cineRes.data.meta;
+            if (m.name) nazvy.add(decode(m.name).trim());
+            if (m.original_name) nazvy.add(decode(m.original_name).trim());
+            if (m.aliases) m.aliases.forEach(a => nazvy.add(decode(a).trim()));
+        }
+
+        if (tmdbRes && tmdbRes.data) {
+            let tmdbId = null;
+            if (vlastnyTyp === "series" && tmdbRes.data.tv_results?.length > 0) {
+                tmdbId = tmdbRes.data.tv_results[0].id;
+                nazvy.add(tmdbRes.data.tv_results[0].name);
+            } else if (vlastnyTyp === "movie" && tmdbRes.data.movie_results?.length > 0) {
+                tmdbId = tmdbRes.data.movie_results[0].id;
+                nazvy.add(tmdbRes.data.movie_results[0].title);
+            }
+
+            if (tmdbId) {
+                try {
+                    const trans = await axios.get(`https://api.themoviedb.org/3/${tmdbTyp}/${tmdbId}/translations`, { params: { api_key: TMDB_API_KEY }, timeout: 4000 });
+                    if (trans.data?.translations) {
+                        trans.data.translations.forEach(tr => {
+                            const m = (tr.data || {}).title || (tr.data || {}).name;
+                            if (m && ["cs", "sk", "en"].includes(tr.iso_639_1)) nazvy.add(m);
+                        });
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
+
+        if (imdbId === "tt27543632") { nazvy.add("Pomocnice"); nazvy.add("Pomocníčka"); }
+        if (imdbId === "tt0903747")  { nazvy.add("Perníkový táta"); nazvy.add("Pernikovy tata"); }
+        if (imdbId === "tt27497448") { nazvy.add("Rytíř sedmi království"); nazvy.add("Rytier siedmich kráľovstiev"); }
+
+        const finalne = [...nazvy].filter(Boolean).filter(t => !t.toLowerCase().startsWith("výsledky"));
+        return finalne;
+    });
 }
 
 // ===================================================================
-// SKTorrent vyhľadávanie
+// Vyhľadávanie na Lokálnom trackeri
 // ===================================================================
 async function hladatTorrenty(dotaz) {
     if (!dotaz || dotaz.trim().length < 2) return [];
-    console.log(`[INFO] 🔎 Hľadám '${dotaz}' na SKTorrent...`);
-    try {
-        const res = await axios.get(SEARCH_URL, {
-            params: { search: dotaz, category: 0 },
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                "Cookie": `uid=${SKT_UID}; pass=${SKT_PASS}`,
-                "Referer": BASE_URL,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.8,en-US;q=0.7"
-            },
-            timeout: 10000
-        });
+    
+    return withCache(`search:${dotaz}`, 600000, async () => {
+        try {
+            const res = await fastAxios.get(SEARCH_URL, { params: { search: dotaz, category: 0 } });
+            const $ = cheerio.load(res.data);
+            const vysledky = [];
 
-        const $ = cheerio.load(res.data);
-        const vysledky = [];
+            $('a[href^="details.php"] img').each((i, img) => {
+                const rodic = $(img).closest("a");
+                const bunka = rodic.closest("td");
+                const text = bunka.text().replace(/\s+/g, " ").trim();
+                const odkaz = rodic.attr("href") || "";
+                const nazov = rodic.attr("title") || "";
+                const torrentId = odkaz.split("id=").pop();
+                const kategoria = bunka.find("b").first().text().trim();
+                const velkostMatch = text.match(/Velkost\s([^|]+)/i);
+                const seedMatch = text.match(/Odosielaju\s*:\s*(\d+)/i);
 
-        $('a[href^="details.php"] img').each((i, img) => {
-            const rodic = $(img).closest("a");
-            const bunka = rodic.closest("td");
-            const text = bunka.text().replace(/\s+/g, " ").trim();
-            const odkaz = rodic.attr("href") || "";
-            const nazov = rodic.attr("title") || "";
-            const torrentId = odkaz.split("id=").pop();
-            const kategoria = bunka.find("b").first().text().trim();
-            const velkostMatch = text.match(/Velkost\s([^|]+)/i);
-            const seedMatch = text.match(/Odosielaju\s*:\s*(\d+)/i);
+                if (!kategoria.toLowerCase().includes("film") && !kategoria.toLowerCase().includes("seri") &&
+                    !kategoria.toLowerCase().includes("dokum") && !kategoria.toLowerCase().includes("tv")) return;
 
-            if (!kategoria.toLowerCase().includes("film") && 
-    !kategoria.toLowerCase().includes("seri") &&
-    !kategoria.toLowerCase().includes("dokum") &&
-    !kategoria.toLowerCase().includes("tv")) return;
-
-
-            vysledky.push({
-                name: nazov,
-                id: torrentId,
-                size: velkostMatch ? velkostMatch[1].trim() : "?",
-                seeds: seedMatch ? seedMatch[1] : "0",
-                category: kategoria,
-                downloadUrl: `${BASE_URL}/torrent/download.php?id=${torrentId}`
+                vysledky.push({
+                    name: nazov, id: torrentId,
+                    size: velkostMatch ? velkostMatch[1].trim() : "?",
+                    seeds: seedMatch ? parseInt(seedMatch[1]) : 0,
+                    category: kategoria,
+                    downloadUrl: `${BASE_URL}/torrent/download.php?id=${torrentId}`
+                });
             });
-        });
 
-        console.log(`[INFO] 📦 Nájdených torrentov: ${vysledky.length}`);
-        return vysledky;
-    } catch (chyba) {
-        console.error("[ERROR] Vyhľadávanie zlyhalo:", chyba.message);
-        return [];
-    }
+            return vysledky.sort((a, b) => b.seeds - a.seeds); 
+        } catch (chyba) {
+            return [];
+        }
+    });
 }
 
+// ===================================================================
+// Sťahovanie a spracovanie .torrent obsahu
+// ===================================================================
 async function stiahnutTorrentData(url) {
-    try {
-        const res = await axios.get(url, {
-            responseType: "arraybuffer",
-            headers: {
-                "User-Agent": "Mozilla/5.0",
-                "Cookie": `uid=${SKT_UID}; pass=${SKT_PASS}`,
-                "Referer": `${BASE_URL}/torrent/torrents_v2.php`,
-                "Connection": "keep-alive"
-            },
-            timeout: 10000
-        });
+    return withCache(`torrent:${url}`, 86400000, async () => { 
+        try {
+            const res = await fastAxios.get(url, { responseType: "arraybuffer" });
+            const bufferString = res.data.toString("utf8", 0, 50);
+            if (bufferString.includes("<html") || bufferString.includes("<!DOC")) return null;
 
-        const bufferString = res.data.toString("utf8", 0, 50);
-        if (bufferString.includes("<html") || bufferString.includes("<!DOC")) {
+            const torrent = bencode.decode(res.data);
+            const info = bencode.encode(torrent.info);
+            const infoHash = crypto.createHash("sha1").update(info).digest("hex");
+
+            let subory = [];
+            if (torrent.info.files) {
+                subory = torrent.info.files.map((file, index) => {
+                    const cesta = (file["path.utf-8"] || file.path || []).map(p => p.toString()).join("/");
+                    return { path: cesta, index };
+                });
+            } else {
+                const nazov = (torrent.info["name.utf-8"] || torrent.info.name || "").toString();
+                subory = [{ path: nazov, index: 0 }];
+            }
+
+            return { infoHash, files: subory };
+        } catch (chyba) {
             return null;
         }
-
-        const torrent = bencode.decode(res.data);
-        const info = bencode.encode(torrent.info);
-        const infoHash = crypto.createHash("sha1").update(info).digest("hex");
-
-        let subory = [];
-        if (torrent.info.files) {
-            subory = torrent.info.files.map((file, index) => {
-                const cesta = (file["path.utf-8"] || file.path || []).map(p => p.toString()).join("/");
-                return { path: cesta, index };
-            });
-        } else {
-            const nazov = (torrent.info["name.utf-8"] || torrent.info.name || "").toString();
-            subory = [{ path: nazov, index: 0 }];
-        }
-
-        return { infoHash, files: subory };
-    } catch (chyba) {
-        return null;
-    }
+    });
 }
 
 async function vytvoritStream(t, seria, epizoda) {
+    const torrentData = await stiahnutTorrentData(t.downloadUrl);
+    if (!torrentData) return null;
+
     const langZhody = t.name.match(/\b([A-Z]{2})\b/g) || [];
     const vlajky = langZhody.map(kod => langToFlag[kod.toUpperCase()]).filter(Boolean);
     const vlajkyText = vlajky.length ? `\n${vlajky.join(" / ")}` : "";
@@ -277,12 +369,10 @@ async function vytvoritStream(t, seria, epizoda) {
         cistyNazov = cistyNazov.slice(t.category.length).trim();
     }
 
-    const torrentData = await stiahnutTorrentData(t.downloadUrl);
-    if (!torrentData) return null;
-
     let streamObj = {
-        title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 sktorrent.eu${vlajkyText}`,
-        name: `SKTorrent\n${t.category}`,
+        title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 Local${vlajkyText}`,
+        // Zatiaľ nedávame do Name žiadny prefix, urobíme to až po kontrole s TorBoxom
+        name: `SKT\n${t.category.toUpperCase()}`, 
         behaviorHints: { bingeGroup: cistyNazov },
         infoHash: torrentData.infoHash
     };
@@ -292,12 +382,39 @@ async function vytvoritStream(t, seria, epizoda) {
             .filter(f => /\.(mp4|mkv|avi|m4v)$/i.test(f.path))
             .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: "base" }));
 
-        let najdenyIndex = -1;
         if (videoSubory.length === 0) return null;
+        let najdenyIndex = -1;
+
+        const epCislo = parseInt(epizoda);
+        const epStr = String(epCislo).padStart(2, "0");
+        const seriaStr = String(seria).padStart(2, "0");
+
+        const epRegexy = [
+            new RegExp(`\\b${seria}x${epStr}\\b`, "i"),
+            new RegExp(`\\b${seriaStr}x${epStr}\\b`, "i"),
+            new RegExp(`S${seriaStr}[._-]?E${epStr}(?![0-9])`, "i"),
+            new RegExp(`Ep(?:isode)?[._\\s]*0*${epCislo}\\b`, "i"),
+            new RegExp(`\\b0*${epCislo}\\.(?:mp4|mkv|avi|m4v)$`, "i"),
+            new RegExp(`\\b${seria}x0*${epCislo}\\b`, "i"),
+            new RegExp(`(^|/)[\\s._-]*0*${epCislo}[\\s._-]+.*\\.(?:mp4|mkv|avi|m4v)$`, "i")
+        ];
 
         if (videoSubory.length === 1) {
+            const nazovSuboru = videoSubory[0].path;
+            
+            // Extrahujeme reálne číslo epizódy zo samotného súboru vo vnútri torrentu
+            const najdeneESubor = nazovSuboru.match(new RegExp(`S${seriaStr}[._-]?E(\\d{1,3})`, "i")) || 
+                                  nazovSuboru.match(new RegExp(`\\b${seria}x(\\d{1,3})`, "i")) ||
+                                  nazovSuboru.match(new RegExp(`Ep(?:isode)?[._\\s]*(\\d{1,3})\\b`, "i"));
+            
+            // Ak vo vnútri nájde, že to je napr. E05, ale my chceme E02, ZAHODÍ TO
+            if (najdeneESubor && parseInt(najdeneESubor[1]) !== epCislo) {
+                return null;
+            }
+            
             najdenyIndex = videoSubory[0].index;
         } else {
+
             const epCislo = parseInt(epizoda);
             const epStr = String(epCislo).padStart(2, "0");
             const seriaStr = String(seria).padStart(2, "0");
@@ -307,23 +424,14 @@ async function vytvoritStream(t, seria, epizoda) {
                 new RegExp(`\\b${seriaStr}x${epStr}\\b`, "i"),
                 new RegExp(`S${seriaStr}[._-]?E${epStr}(?![0-9])`, "i"),
                 new RegExp(`Ep(?:isode)?[._\\s]*0*${epCislo}\\b`, "i"),
-                new RegExp(`\\b0*${epCislo}\\.(?:mp4|mkv|avi|m4v)$`, "i")
+                new RegExp(`\\b0*${epCislo}\\.(?:mp4|mkv|avi|m4v)$`, "i"),
+                new RegExp(`\\b${seria}x0*${epCislo}\\b`, "i"),
+                new RegExp(`(^|/)[\\s._-]*0*${epCislo}[\\s._-]+.*\\.(?:mp4|mkv|avi|m4v)$`, "i")
             ];
 
             for (const reg of epRegexy) {
                 const zhoda = videoSubory.find(f => reg.test(f.path));
                 if (zhoda) { najdenyIndex = zhoda.index; break; }
-            }
-
-            if (najdenyIndex === -1) {
-                const volneRegexy = [
-                    new RegExp(`\\b${seria}x0*${epCislo}\\b`, "i"),
-                    new RegExp(`(^|/)[\\s._-]*0*${epCislo}[\\s._-]+.*\\.(?:mp4|mkv|avi|m4v)$`, "i")
-                ];
-                for (const volnyReg of volneRegexy) {
-                    const zhodaVolna = videoSubory.find(f => volnyReg.test(f.path));
-                    if (zhodaVolna) { najdenyIndex = zhodaVolna.index; break; }
-                }
             }
         }
 
@@ -335,25 +443,17 @@ async function vytvoritStream(t, seria, epizoda) {
 }
 
 // ===================================================================
-// Hlavný handler
+// HLAVNÝ HANDLER
 // ===================================================================
 builder.defineStreamHandler(async ({ type: aplikaciaTyp, id }) => {
-    console.log(`\n====== 🎮 RAW Požiadavka: type z aplikacie='${aplikaciaTyp}', id='${id}' ======`);
+    console.log(`\n====== 🎮 RAW Požiadavka: type='${aplikaciaTyp}', id='${id}' ======`);
     
-    // TENTO KROK JE KLÚČOVÝ PRE NUVIO BUG:
-    // Ak id obsahuje dvojbodky (napr. tt123456:1:2), JE TO SERIÁL.
-    // Ignorujeme to, čo nám hovorí aplikácia (Nuvio) v type, a urobíme si vlastný.
     const jeToSerialPodlaId = id.includes(":");
     const [imdbId, sRaw, eRaw] = id.split(":");
-    
     const seria = (jeToSerialPodlaId && sRaw) ? parseInt(sRaw) : undefined;
     const epizoda = (jeToSerialPodlaId && eRaw) ? parseInt(eRaw) : undefined;
-    
-    // Náš vlastný spoľahlivý typ
     const vlastnyTyp = jeToSerialPodlaId ? "series" : "movie";
-    console.log(`[INFO] 🕵️ Zistený reálny typ z ID: ${vlastnyTyp} (Aplikácia hlásila: ${aplikaciaTyp})`);
 
-    // Pošleme náš vlastný zistený typ do funkcií na hľadanie názvu z TMDB/Cinemeta
     const suroveNazvy = await ziskatVsetkyNazvy(imdbId, vlastnyTyp);
     if (!suroveNazvy.length) return { streams: [] };
 
@@ -368,35 +468,56 @@ builder.defineStreamHandler(async ({ type: aplikaciaTyp, id }) => {
     const dotazy = new Set();
     unikatneNazvy.forEach(zaklad => {
         const bezDia = odstranDiakritiku(zaklad);
-        const kratky = skratNazov(bezDia);
+        const kratky = skratNazov(bezDia, 3); // Kratší názov pre väčšiu šancu na úspech
 
-        if (vlastnyTyp === "series" && seria && epizoda) {
-            const epTag  = ` S${String(seria).padStart(2, "0")}E${String(epizoda).padStart(2, "0")}`;
-            const epTag2 = ` ${seria}x${String(epizoda).padStart(2, "0")}`;
-            const sTag1  = ` S${String(seria).padStart(2, "0")}`;
-            const sTag2  = ` ${seria}.Serie`;
+        if (vlastnyTyp === "series" && seria !== undefined && epizoda !== undefined) {
+            const epTag  = ` S${String(seria).padStart(2, "0")}E${String(epizoda).padStart(2, "0")}`; // S01E03
+            const epTag2 = ` ${seria}x${String(epizoda).padStart(2, "0")}`; // 1x03
+            const sTag1  = ` S${String(seria).padStart(2, "0")}`; // S01
+            const sTag2  = ` ${seria}.série`; // Bez medzery: "1.série"
+            const sTag3  = ` ${seria}. série`; // S medzerou: "1. série"
 
-            [zaklad, bezDia, kratky].forEach(b => {
-                if (!b.trim()) return;
-                dotazy.add(b + epTag);
-                dotazy.add(b + epTag2);
-                dotazy.add((b + epTag).replace(/\s+/g, "."));
-                dotazy.add(b + sTag1);
-                dotazy.add(b + sTag2);
-            });
+            // 1. Hľadanie presnej epizódy (napr. S01E03)
+            dotazy.add(bezDia + epTag);
+            dotazy.add(zaklad + epTag);
+            
+            // 2. Hľadanie Špecifických CZ/SK Balíkov (napr. "1. série")
+            dotazy.add(bezDia + sTag3); 
+            dotazy.add(kratky + sTag3); 
+            dotazy.add(bezDia + sTag2); 
+            dotazy.add(kratky + sTag2); 
+            
+            // 3. Hľadanie štandardných balíkov (napr. "S01")
+            dotazy.add(bezDia + sTag1); 
+            dotazy.add(kratky + sTag1); 
+            
+            // 4. Hľadanie iných formátov epizódy (napr. 1x03)
+            dotazy.add(bezDia + epTag2);
+            dotazy.add(kratky + epTag2);
+
+            // 5. NAJDÔLEŽITEJŠIE PRE VEĽKÉ BALÍKY (ako S01-S08):
+            // Nakoniec prikážeme hľadať LEN samotný názov seriálu (napr. "Zachranari L.A.").
+            // Vďaka tomu nám SKTorrent vráti tie obrovské torrenty a tvoj nový filter si v nich už nájde epizódu.
+            dotazy.add(bezDia);
+            dotazy.add(kratky);
+
         } else {
+            // Toto platí pre Filmy
             [zaklad, bezDia, kratky].forEach(b => {
                 if (!b.trim()) return;
                 dotazy.add(b);
-                dotazy.add(b.replace(/[':]/g, ""));
             });
         }
     });
+
+
+
 
     let torrenty = [];
     let pokus = 1;
     const videnieTorrentIds = new Set();
 
+    // Hľadanie na lokálnom trackeri
     for (const d of dotazy) { 
         console.log(`[DEBUG] 🔍 Pokus ${pokus++}: Hľadám '${d}'`);
         const najdene = await hladatTorrenty(d);
@@ -406,29 +527,245 @@ builder.defineStreamHandler(async ({ type: aplikaciaTyp, id }) => {
                 videnieTorrentIds.add(t.id);
             }
         }
-        if (torrenty.length >= (vlastnyTyp === "movie" ? 5 : 3)) break;
-        if (pokus > 10) break;
+        // !!! ZVÝŠENÝ LIMIT ABY NEPRESTALO HĽADAŤ PREDČASNE !!!
+        if (torrenty.length >= 8) break; 
+        if (pokus > 8) break; 
     }
+
 
     if (seria !== undefined) {
-        torrenty = torrenty.filter(t => torrentSedisSeriou(t.name, seria));
-        torrenty = torrenty.filter(t => torrentSediSEpizodou(t.name, seria, epizoda));
+        torrenty = torrenty.filter(t => torrentSedisSeriou(t.name, seria) && torrentSediSEpizodou(t.name, seria, epizoda));
     }
 
-    const streamy = [];
-    for (const t of torrenty) {
-        await delay(300);
-        const stream = await vytvoritStream(t, seria, epizoda);
-        if (stream) streamy.push(stream);
+    // 1. Získanie infoHash a videí (Paralelne, max 5 naraz)
+    const execLimit = pLimit(5);
+    let streamy = (await Promise.all(
+        torrenty.map(t => execLimit(() => vytvoritStream(t, seria, epizoda)))
+    )).filter(Boolean);
+
+    // 2. TORBOX INTEGRÁCIA: Ak máme TorBox kľúč a našli sme streamy
+    if (TORBOX_API_KEY && streamy.length > 0) {
+        const hasheKONTROLA = streamy.map(s => s.infoHash).filter(Boolean); // Extrahujeme infoHashe
+        
+        // --- TENTO RIADOK TI CHÝBAL ---
+        // Tu zistíme, čo reálne TorBox má alebo nemá v cache (vráti napr. { "hash1": true })
+        const torboxCache = await overitTorboxCache(hasheKONTROLA);
+
+        // Prejdeme vytvorené streamy a modifikujeme ich na HTTP/Proxy verzie
+        streamy = streamy.map(stream => {
+            const hash = stream.infoHash.toLowerCase();
+            const indexSuboru = stream.fileIdx || 0; // Index videa v torrente
+            
+            // Overíme proti výsledku z TorBox API
+            const jeCached = torboxCache[hash] === true;
+            
+            const staraKategoria = stream.name.split("\n")[1] || "";
+
+            if (jeCached) {
+                // Cached (⚡) - TOTO PREHRÁVA PRIAMO Z TORBOXU CEZ HTTP
+                stream.name = `[TB ⚡] SKT\n${staraKategoria}`;
+                // Zmeníme objekt: odstránime infoHash a dáme mu HTTP URL na náš proxy
+                // Namiesto indexu pošleme do proxy Séria/Epizóda
+                const proxySeria = seria || "1";
+                const proxyEpizoda = epizoda || "1";
+                stream.url = `http://localhost:7000/play/${hash}/${proxySeria}/${proxyEpizoda}`;
+                delete stream.infoHash;
+                delete stream.fileIdx;
+            } else {
+                // Uncached (⏳) - TOTO SPUSTÍ SŤAHOVANIE NA TORBOXE
+                stream.name = `[TB ⏳] SKT\n${staraKategoria}`;
+                // Nasmerujeme na "Download" endpoint
+                stream.url = `http://localhost:7000/download/${hash}`;
+                delete stream.infoHash;
+                delete stream.fileIdx;
+            }
+            return stream;
+        });
+
+        // 3. ZORADENIE: Cached streamy chceme vidieť v Stremio prvé
+        streamy.sort((a, b) => {
+            const aCached = a.name.includes("⚡") ? 1 : 0;
+            const bCached = b.name.includes("⚡") ? 1 : 0;
+            return bCached - aCached;
+        });
     }
 
     console.log(`[INFO] ✅ Odosielam ${streamy.length} streamov do Stremio`);
     return { streams: streamy };
 });
 
+
 builder.defineCatalogHandler(() => ({ metas: [] }));
+// ===================================================================
+// TORBOX PROXY ROUTER: Presmerovanie Stremio na TorBox HTTP Stream
+// ===================================================================
+const express = require("express");
+const FormData = require("form-data"); // Potrebujeme na správne odoslanie do TorBoxu
+const app = express();
 
-serveHTTP(builder.getInterface(), { port: 7000 });
-console.log("🚀 SKTorrent addon beží na http://localhost:7000/manifest.json");
+// --- 1. Endpoint pre Cached streamy (⚡) ---
+app.get("/play/:hash/:seria/:epizoda", async (req, res) => {
+    const { hash, seria, epizoda } = req.params;
+    
+    try {
+        console.log(`\n▶️ [PROXY] Stremio žiada prehratie - Hash: ${hash} | Séria: ${seria} | Epizóda: ${epizoda}`);
 
+        // 1. Zistíme, či ho už máme na účte
+        const tbTorrentsRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
+            headers: { "Authorization": `Bearer ${TORBOX_API_KEY}` }
+        });
+        
+        let torrentId = null;
+        let najdenyTorrentObj = null;
+
+        if (tbTorrentsRes.data && tbTorrentsRes.data.data) {
+            const zoznam = Array.isArray(tbTorrentsRes.data.data) ? tbTorrentsRes.data.data : [tbTorrentsRes.data.data];
+            najdenyTorrentObj = zoznam.find(t => t.hash && t.hash.toLowerCase() === hash.toLowerCase());
+            if (najdenyTorrentObj) {
+                torrentId = najdenyTorrentObj.id;
+            }
+        }
+
+        // 2. Ak ho tam nemáme, pridáme ho
+        if (!torrentId) {
+            console.log(`[PROXY] Pridávam Cached torrent do TorBoxu...`);
+            const formData = new FormData();
+            formData.append("magnet", `magnet:?xt=urn:btih:${hash}`);
+
+            const addRes = await axios.post("https://api.torbox.app/v1/api/torrents/createtorrent", formData, {
+                headers: { "Authorization": `Bearer ${TORBOX_API_KEY}`, ...formData.getHeaders() }
+            });
+            torrentId = addRes.data?.data?.torrent_id;
+            await new Promise(r => setTimeout(r, 3000));
+            
+            const tbRefreshRes = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
+                headers: { "Authorization": `Bearer ${TORBOX_API_KEY}` }
+            });
+            if (tbRefreshRes.data && tbRefreshRes.data.data) {
+                const zoznamRefresh = Array.isArray(tbRefreshRes.data.data) ? tbRefreshRes.data.data : [tbRefreshRes.data.data];
+                najdenyTorrentObj = zoznamRefresh.find(t => t.id === torrentId);
+            }
+        }
+
+        // 3. INTELIGENTNÉ HĽADANIE SPRÁVNEHO SÚBORU PODĽA SÉRIE A EPIZÓDY
+        let spravneFileId = null;
+        
+        if (najdenyTorrentObj && najdenyTorrentObj.files && seria && epizoda) {
+            const epCislo = parseInt(epizoda);
+            const epStr = String(epCislo).padStart(2, "0");
+            const seriaStr = String(seria).padStart(2, "0");
+
+            // Rôzne spôsoby, akými môže byť súbor pomenovaný
+            const epRegexy = [
+                new RegExp(`\\b${seria}x${epStr}\\b`, "i"), // napr. 1x21
+                new RegExp(`\\b${seriaStr}x${epStr}\\b`, "i"), // napr. 01x21
+                new RegExp(`S${seriaStr}[._-]?E${epStr}(?![0-9])`, "i"), // napr. S01E21
+                new RegExp(`Ep(?:isode)?[._\\s]*0*${epCislo}\\b`, "i"), // napr. Ep21
+                new RegExp(`\\b0*${epCislo}\\.(?:mp4|mkv|avi|m4v)$`, "i") // napr. 21.mp4
+            ];
+
+            // Nájdeme len video súbory
+            const videoSúbory = najdenyTorrentObj.files.filter(f => /\.(mp4|mkv|avi|m4v)$/i.test(f.name));
+
+            for (const reg of epRegexy) {
+                const zhoda = videoSúbory.find(f => reg.test(f.name));
+                if (zhoda) { 
+                    spravneFileId = zhoda.id; 
+                    console.log(`👉 [PROXY MATCH] Našiel som súbor! ID: ${spravneFileId} | Názov: ${zhoda.name}`);
+                    break; 
+                }
+            }
+            
+            // Ak nenájde konkrétnu zhodu, zoberie najväčší súbor (najmä pre filmy to pomáha)
+            if (spravneFileId === null && videoSúbory.length > 0) {
+                videoSúbory.sort((a, b) => b.size - a.size);
+                spravneFileId = videoSúbory[0].id;
+                console.log(`⚠️ [PROXY MATCH] Nenašiel som zhodu pre S${seriaStr}E${epStr}. Vyberám najväčší súbor: ${videoSúbory[0].name}`);
+            }
+        }
+
+        // Ak to z nejakého dôvodu stále nemá ID, fallback na "0"
+        if (spravneFileId === null) spravneFileId = 0;
+
+        // 4. Požiadame TorBox o linku pre správny súbor
+        const downloadRes = await axios.get("https://api.torbox.app/v1/api/torrents/requestdl", {
+            params: {
+                token: TORBOX_API_KEY,
+                torrent_id: torrentId,
+                file_id: spravneFileId, // TU ODOVZDÁVAME TORBOXOVÉ ID
+                zip_link: false
+            },
+            headers: { "Authorization": `Bearer ${TORBOX_API_KEY}` }
+        });
+
+        const directLink = downloadRes.data?.data;
+        
+        if (directLink) {
+            res.redirect(302, directLink);
+        } else {
+            res.status(404).send("Torbox nevrátil URL.");
+        }
+    } catch (err) {
+        console.error("[ERROR] Play zlyhalo:", err.response?.data || err.message);
+        res.status(500).send("Chyba proxy servera.");
+    }
+});
+
+
+
+// --- 2. Endpoint pre Uncached streamy (⌛) ---
+app.get("/download/:hash", async (req, res) => {
+    const { hash } = req.params;
+    
+    try {
+        console.log(`[INFO] Sťahujem Uncached torrent do TorBoxu (Hash: ${hash})`);
+        
+        const formData = new FormData();
+        formData.append("magnet", `magnet:?xt=urn:btih:${hash}`);
+
+        await axios.post("https://api.torbox.app/v1/api/torrents/createtorrent", formData, {
+            headers: { 
+                "Authorization": `Bearer ${TORBOX_API_KEY}`,
+                ...formData.getHeaders()
+            }
+        });
+
+        console.log(`[INFO] TorBox úspešne začal sťahovanie!`);
+
+        // ZNEPLATNENIE LOKÁLNEJ CACHE!
+        // Akonáhle začne sťahovanie, prejdeme celú našu cache pamäť
+        for (const [key, value] of cache.entries()) {
+            // Ak ide o TorBox cache a obsahuje hash, ktorý práve sťahujeme
+            if (key.startsWith("torbox:") && key.includes(hash.toLowerCase())) {
+                cache.delete(key); // Vymažeme ho
+                console.log(`[INFO] 🧹 Zmazal som starú TorBox cache pre tento hash. Pri ďalšom načítaní sa skontroluje naostro!`);
+            }
+        }
+
+        // Presmerujeme Stremio na náš vlastný lokálny súbor s videom
+        res.redirect(302, "http://localhost:7000/info-video");
+        
+    } catch (err) {
+        console.error("[ERROR] Zlyhalo stahovanie do TorBoxu:", err.response?.data || err.message);
+        res.status(500).send("Chyba API.");
+    }
+});
+
+// --- NOVÝ ENDPOINT PRE LOKÁLNE VIDEO ---
+const path = require("path");
+
+app.get("/info-video", (req, res) => {
+    // Pošle Stremio klientovi súbor "stahuje-sa.mp4", ktorý máš uložený vedľa addonu
+    res.sendFile(path.join(__dirname, "stahuje-sa.mp4")); 
+});
+
+
+// Prepojíme tvoj Stremio builder s našim Express proxy serverom
+const { getRouter } = require("stremio-addon-sdk");
+app.use("/", getRouter(builder.getInterface()));
+
+const PORT = 7000;
+app.listen(PORT, () => {
+    console.log(`🚀 SKTorrent Local + TorBox PROXY beží na http://localhost:${PORT}/manifest.json`);
+});
 
