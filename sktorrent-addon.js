@@ -1,4 +1,4 @@
-// SKTorrent Local Addon v1.3.0 - OPTIMALIZOVANÝ + TORBOX
+// SKTorrent Addon v1.3.0 + TORBOX
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const { decode } = require("entities");
 const axios = require("axios");
@@ -68,8 +68,8 @@ function pLimit(limit) {
 const builder = addonBuilder({
     id: "org.stremio.sktorrent.local.torbox",
     version: "1.3.0",
-    name: "SKT Local + TorBox",
-    description: "Rýchly lokálny SKTorrent s detekciou TorBox Cache",
+    name: "SKTorrent + TorBox",
+    description: "SKTorrent s TorBox",
     types: ["movie", "series"],
     catalogs: [
         { type: "movie", id: "skt-movie", name: "SKT Filmy" },
@@ -372,7 +372,7 @@ async function vytvoritStream(t, seria, epizoda) {
     }
 
     let streamObj = {
-        title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 Local${vlajkyText}`,
+        title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 SKTorrent${vlajkyText}`,
         // Zatiaľ nedávame do Name žiadny prefix, urobíme to až po kontrole s TorBoxom
         name: `SKT\n${t.category.toUpperCase()}`, 
         behaviorHints: { bingeGroup: cistyNazov },
@@ -765,8 +765,9 @@ const { getRouter } = require("stremio-addon-sdk");
 app.use("/", getRouter(builder.getInterface()));
 
 app.listen(PORT, () => {
-    console.log(`🚀 SKTorrent Local + TorBox PROXY beží na ${PUBLIC_URL}/manifest.json`);
+    console.log(`🚀 SKTorrent + TorBox PROXY beží na ${PUBLIC_URL}/manifest.json`);
 });
+
 
 
 
