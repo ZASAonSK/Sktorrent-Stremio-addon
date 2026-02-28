@@ -88,7 +88,6 @@ Ak to chceš mať 24/7 aj na mobile/TV bez zapnutého PC:
 
 Potom do Stremio pridáš:
 
-text
 https://tvoj-addon.onrender.com/manifest.json
 
 Troubleshooting
