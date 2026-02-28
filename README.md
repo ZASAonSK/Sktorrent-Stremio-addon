@@ -40,7 +40,6 @@ Addon pri každom streame zobrazí stav TorBox cache:
 
     Vytvor .env v koreňovom priečinku (vedľa hlavného .js súboru) a doplň hodnoty:
 
-    text
     # SKTorrent cookies (z prehliadača po prihlásení na sktorrent.eu)
     SKT_UID=xxx
     SKT_PASS=xxx
@@ -66,7 +65,6 @@ Addon pri každom streame zobrazí stav TorBox cache:
 
     V Stremio → Addons → „Add addon“ vlož URL:
 
-    text
     http://localhost:7000/manifest.json
 
 Inštalácia do Stremio
