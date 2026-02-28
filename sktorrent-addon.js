@@ -357,6 +357,19 @@ async function stiahnutTorrentData(url) {
         }
     });
 }
+async function stiahnutSurovyTorrent(url) {
+    return withCache(`rawtorrent:${url}`, 86400000, async () => {
+        try {
+            const res = await fastAxios.get(url, { responseType: "arraybuffer" });
+            const bufferString = res.data.toString("utf8", 0, 50);
+            if (bufferString.includes("<html") || bufferString.includes("<!DOC")) return null;
+            return res.data; // Vraciame čistý Buffer
+        } catch (chyba) {
+            console.error("[ERROR] Zlyhalo stiahnutie surového torrentu:", chyba.message);
+            return null;
+        }
+    });
+}
 
 async function vytvoritStream(t, seria, epizoda) {
     const torrentData = await stiahnutTorrentData(t.downloadUrl);
@@ -371,13 +384,15 @@ async function vytvoritStream(t, seria, epizoda) {
         cistyNazov = cistyNazov.slice(t.category.length).trim();
     }
 
-    let streamObj = {
-        title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 SKTorrent${vlajkyText}`,
-        // Zatiaľ nedávame do Name žiadny prefix, urobíme to až po kontrole s TorBoxom
-        name: `SKT\n${t.category.toUpperCase()}`, 
-        behaviorHints: { bingeGroup: cistyNazov },
-        infoHash: torrentData.infoHash
-    };
+let streamObj = {
+    title: `${cistyNazov}\n👤 ${t.seeds}  📀 ${t.size}  🌐 SKTorrent${vlajkyText}`,
+    name: `SKT\n${t.category.toUpperCase()}`,
+    behaviorHints: { bingeGroup: cistyNazov },
+    infoHash: torrentData.infoHash,
+
+    // DÔLEŽITÉ: potrebujeme ID torrentu, aby sme vedeli stiahnuť .torrent súbor pri kliknutí na ⏳
+    sktId: t.id
+};
 
     if (seria !== undefined && epizoda !== undefined) {
         const videoSubory = torrentData.files
@@ -571,13 +586,17 @@ builder.defineStreamHandler(async ({ type: aplikaciaTyp, id }) => {
                 stream.url = `${PUBLIC_URL}/play/${hash}/${proxySeria}/${proxyEpizoda}`;
                 delete stream.infoHash;
                 delete stream.fileIdx;
-            } else {
-                stream.name = `[TB ⏳] SKT\n${staraKategoria}`;
-                // ZMENA LOKALHOSTU NA PREMENNÚ
-                stream.url = `${PUBLIC_URL}/download/${hash}`;
-                delete stream.infoHash;
-                delete stream.fileIdx;
-            }
+} else {
+    stream.name = `[TB ⏳] SKT\n${staraKategoria}`;
+
+    // Posielame aj SKTorrent ID, aby sme vedeli dotiahnuť .torrent súbor (private torrenty bez DHT)
+    stream.url = `${PUBLIC_URL}/download/${hash}/${stream.sktId}`;
+
+    delete stream.infoHash;
+    delete stream.fileIdx;
+    delete stream.sktId;
+}
+
 
             return stream;
         });
@@ -714,42 +733,58 @@ app.get("/play/:hash/:seria/:epizoda", async (req, res) => {
 
 
 // --- 2. Endpoint pre Uncached streamy (⌛) ---
-app.get("/download/:hash", async (req, res) => {
-    const { hash } = req.params;
-    
-    try {
-        console.log(`[INFO] Sťahujem Uncached torrent do TorBoxu (Hash: ${hash})`);
-        
-        const formData = new FormData();
-        formData.append("magnet", `magnet:?xt=urn:btih:${hash}`);
+// Zmena: berieme aj SKTorrent ID, aby sme vedeli stiahnuť reálny .torrent súbor a poslať ho do TorBoxu
+app.get("/download/:hash/:sktId", async (req, res) => {
+    const { hash, sktId } = req.params;
 
-        await axios.post("https://api.torbox.app/v1/api/torrents/createtorrent", formData, {
-            headers: { 
-                "Authorization": `Bearer ${TORBOX_API_KEY}`,
-                ...formData.getHeaders()
-            }
+    try {
+        console.log(`[INFO] Sťahujem Uncached torrent do TorBoxu (Hash: ${hash}, SKT ID: ${sktId})`);
+
+        const torrentUrl = `${BASE_URL}/torrent/download.php?id=${sktId}`;
+
+        // Stiahneme surový .torrent súbor (Buffer)
+        const torrentBuffer = await stiahnutSurovyTorrent(torrentUrl);
+
+        if (!torrentBuffer) {
+            console.error("[ERROR] Nepodarilo sa stiahnuť .torrent súbor zo SKTorrentu.");
+            return res.status(500).send("Nepodarilo sa stiahnuť .torrent súbor.");
+        }
+
+        const formData = new FormData();
+
+        // Posielame priamo .torrent súbor (najlepšie pre private torrenty bez DHT/PEX)
+        // Pozn.: ak by TorBox pýtal iný názov poľa, najčastejšie alternatívy sú "file" alebo "torrent".
+        formData.append("file", torrentBuffer, {
+            filename: `${hash}.torrent`,
+            contentType: "application/x-bittorrent"
         });
 
-        console.log(`[INFO] TorBox úspešne začal sťahovanie!`);
+        await axios.post("https://api.torbox.app/v1/api/torrents/createtorrent", formData, {
+            headers: {
+                "Authorization": `Bearer ${TORBOX_API_KEY}`,
+                ...formData.getHeaders()
+            },
+            timeout: 15000
+        });
 
-        // ZNEPLATNENIE LOKÁLNEJ CACHE!
-        // Akonáhle začne sťahovanie, prejdeme celú našu cache pamäť
-        for (const [key, value] of cache.entries()) {
-            // Ak ide o TorBox cache a obsahuje hash, ktorý práve sťahujeme
+        console.log(`[INFO] TorBox úspešne začal sťahovanie (.torrent upload)!`);
+
+        // ZNEPLATNENIE LOKÁLNEJ CACHE pre tento hash
+        for (const key of cache.keys()) {
             if (key.startsWith("torbox:") && key.includes(hash.toLowerCase())) {
-                cache.delete(key); // Vymažeme ho
-                console.log(`[INFO] 🧹 Zmazal som starú TorBox cache pre tento hash. Pri ďalšom načítaní sa skontroluje naostro!`);
+                cache.delete(key);
+                console.log(`[INFO] 🧹 Zmazal som starú TorBox cache pre tento hash.`);
             }
         }
 
-        // Presmerujeme Stremio na server
         res.redirect(302, `${PUBLIC_URL}/info-video`);
-        
+
     } catch (err) {
         console.error("[ERROR] Zlyhalo stahovanie do TorBoxu:", err.response?.data || err.message);
         res.status(500).send("Chyba API.");
     }
 });
+
 
 // --- NOVÝ ENDPOINT PRE LOKÁLNE VIDEO ---
 const path = require("path");
@@ -767,6 +802,7 @@ app.use("/", getRouter(builder.getInterface()));
 app.listen(PORT, () => {
     console.log(`🚀 SKTorrent + TorBox PROXY beží na ${PUBLIC_URL}/manifest.json`);
 });
+
 
 
 
