@@ -1,21 +1,21 @@
 # SKTorrent + TorBox (Stremio Addon)
 
-Stremio addon, ktorý vyhľadáva CZ/SK torrenty na **sktorrent.eu** a prehráva ich cez TorBox (debrid) – bez P2P streamovania v Stremio. [cite:2][cite:11]
+Stremio addon, ktorý vyhľadáva CZ/SK torrenty na **sktorrent.eu** a prehráva ich cez TorBox (debrid) – bez P2P streamovania v Stremio.
 
 Addon pri každom streame zobrazí stav TorBox cache:
 - `[TB ⚡]` = už je cached v TorBoxe a po kliknutí sa prehráva priamo z TorBoxu (HTTP redirect).
-- `[TB ⏳]` = nie je cached; po kliknutí sa torrent odošle do TorBoxu a zobrazí sa info video („sťahuje sa“). [cite:10][cite:11]
+- `[TB ⏳]` = nie je cached; po kliknutí sa torrent odošle do TorBoxu a zobrazí sa info video („sťahuje sa“).
 
 > Poznámka: Toto je komunitný projekt/fork. Používaj len obsah, na ktorý máš práva.
 
 ---
 
 ## Funkcie
-- Vyhľadávanie torrentov na SKTorrent (filmy/seriály) a filtrovanie epizód podľa názvu + súborov v torrente. [cite:1]
-- Hromadná kontrola TorBox cache a zoradenie výsledkov tak, aby cached boli navrchu. [cite:2]
+- Vyhľadávanie torrentov na SKTorrent (filmy/seriály) a filtrovanie epizód podľa názvu + súborov v torrente.
+- Hromadná kontrola TorBox cache a zoradenie výsledkov tak, aby cached boli navrchu.
 - TorBox proxy router:
-  - `/play/...` presmeruje prehrávač Stremia na priamy TorBox link. [cite:11]
-  - `/download/...` pridá torrent do TorBoxu (spoľahlivé aj pre private torrenty – odosielaním `.torrent` súboru). [cite:10]
+  - `/play/...` presmeruje prehrávač Stremia na priamy TorBox link.
+  - `/download/...` pridá torrent do TorBoxu (spoľahlivé aj pre private torrenty – odosielaním `.torrent` súboru).
 
 ---
 
@@ -75,7 +75,7 @@ Po nainštalovaní addonu bude Stremio zobrazovať streamy s prefixmi:
 
     [TB ⚡] → okamžité prehratie z TorBoxu
 
-    [TB ⏳] → pridanie do TorBoxu + info video, potom refresh a časom sa zmení na ⚡ [cite:11]
+    [TB ⏳] → pridanie do TorBoxu + info video, potom refresh a časom sa zmení na ⚡
 
 Tip: Po kliknutí na ⏳ počkaj pár minút (podľa veľkosti a seedov), potom znova otvor daný film/epizódu v Stremio.
 Deploy (Render / cloud)
@@ -96,10 +96,10 @@ https://tvoj-addon.onrender.com/manifest.json
 Troubleshooting
 
     V Stremio sa nič nedeje po kliknutí na ⏳
-    Skontroluj log servera, či TorBox nevracia chybu a či sa volá endpoint /download/.... [cite:10]
+    Skontroluj log servera, či TorBox nevracia chybu a či sa volá endpoint /download/.... 
 
     ⚡ stream načítava donekonečna
-    TorBox niekedy potrebuje chvíľu, kým sa torrent objaví v mylist/kým sú dostupné súbory; pomôže refresh v Stremio alebo malé oneskorenie v /play logike. [cite:11]
+    TorBox niekedy potrebuje chvíľu, kým sa torrent objaví v mylist/kým sú dostupné súbory; pomôže refresh v Stremio alebo malé oneskorenie v /play logike. 
 
     Nenachádza to výsledky zo SKTorrentu
     Skontroluj, či SKT_UID a SKT_PASS sú správne (cookie), a či nie je dočasne zmenená stránka/HTML selektory.
